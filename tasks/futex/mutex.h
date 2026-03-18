@@ -14,14 +14,17 @@ inline void FutexWake(void* value, int count) {
 }
 
 class Mutex {
-public:
+private:
     enum State : int {
         Unlocked = 0,
         LockedNoWaiters = 1,
         LockedWithWaiters = 2
     };
 
-    Mutex() : m_state(Unlocked) {}
+    std::atomic<int> m_state{Unlocked};
+
+public:
+    Mutex() = default;
 
     Mutex(const Mutex&) = delete;
     Mutex& operator=(const Mutex&) = delete;
@@ -51,7 +54,4 @@ public:
     std::atomic<int>* native_handle() {
         return &m_state;
     }
-
-private:
-    std::atomic<int> m_state;
 };

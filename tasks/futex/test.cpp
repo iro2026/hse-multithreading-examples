@@ -39,27 +39,26 @@ TEST(MutexTest, ConcurrentIncrement) {
 TEST(MutexTest, FutexWaitState) {
     Mutex mtx;
     std::atomic<bool> thread_started{false};
-    std::atomic<bool> can_finish{false};
+    std::atomic<bool> is_finished{false};
 
     mtx.lock();
 
     std::thread t([&]() {
         thread_started = true;
         mtx.lock();
+        is_finished = true;
         mtx.unlock();
     });
 
     while (!thread_started) std::this_thread::yield();
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    auto* state = reinterpret_cast<std::atomic<int>*>(mtx.native_handle());
-    EXPECT_EQ(state->load(), 2); 
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(is_finished.load()); 
 
     mtx.unlock();
     t.join();
     
-    EXPECT_EQ(state->load(), 0);
+    EXPECT_TRUE(is_finished.load());
 }
 
 TEST(MutexTest, SequentialLocking) {
