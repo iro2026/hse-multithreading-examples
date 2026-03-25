@@ -1,132 +1,154 @@
 #pragma once
-#include <iostream>
 #include <vector>
-#include <atomic>
-#include <sys/mman.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <signal.h>
-#include <semaphore.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <functional>
+#include <atomic>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <cstring>
+#include <signal.h>
+#include <iostream>
 
-using TaskFunc = void (*)(const void*, void*);
+const uint32_t MAGIC = 0xDEADBEEF;
 
-struct ResultSlot {
-    sem_t semaphore;
-    char data[1024];
-};
-
-struct Task {
-    TaskFunc func;
-    char arg[1024];
-    size_t slot_idx;
-    std::atomic<bool> filled{false};
-};
-
-struct PoolLayout {
-    static constexpr size_t Q_SIZE = 1024;
-    static constexpr size_t R_SIZE = 1024;
-    std::atomic<size_t> head{0};
-    std::atomic<size_t> tail{0};
-    std::atomic<size_t> next_slot{0};
-    Task tasks[Q_SIZE];
-    ResultSlot results[R_SIZE];
-};
-
-template <typename T>
-class MyFuture {
-    ResultSlot* slot;
-public:
-    MyFuture(ResultSlot* s) : slot(s) {}
-
-    T get() {
-        sem_wait(&slot->semaphore);
-        T result;
-        std::memcpy(&result, slot->data, sizeof(T));
-        return result;
-    }
+struct MessageHeader {
+    uint32_t magic;
+    uint64_t id;
+    uint32_t task_type;
+    uint64_t data_size; 
 };
 
 class ProcessPool {
-    PoolLayout* data;
-    std::vector<pid_t> workers;
-    bool is_main = true;
+    struct Worker { pid_t pid; int write_fd; };
 
-public:
-    ProcessPool(size_t n) {
-        data = (PoolLayout*)mmap(NULL, sizeof(PoolLayout), PROT_READ | PROT_WRITE, 
-                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-        new (data) PoolLayout();
-
-        for (size_t i = 0; i < PoolLayout::R_SIZE; ++i) {
-            sem_init(&data->results[i].semaphore, 1, 0);
+    static bool FullRead(int fd, void* buf, size_t len) {
+        size_t r = 0;
+        while (r < len) {
+            ssize_t n = read(fd, (char*)buf + r, len - r);
+            if (n <= 0) return false;
+            r += n;
         }
+        return true;
+    }
 
-        for (size_t i = 0; i < n; ++i) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                is_main = false;
-                worker_loop();
-                exit(0);
-            }
-            workers.push_back(pid);
+    static void FullWrite(int fd, const void* buf, size_t len) {
+        size_t s = 0;
+        while (s < len) {
+            ssize_t n = write(fd, (const char*)buf + s, len - s);
+            if (n <= 0) break;
+            s += n;
         }
     }
 
-    template <typename T_Res, typename T_Arg>
-    MyFuture<T_Res> Submit(TaskFunc f, T_Arg arg) {
-        while (data->tail.load() - data->head.load() >= PoolLayout::Q_SIZE) {
-            std::this_thread::yield();
+public:
+    using ProcessorFunc = std::function<std::vector<uint8_t>(uint32_t, const std::vector<uint8_t>&)>;
+
+    struct Future {
+        std::mutex m;
+        std::condition_variable cv;
+        std::vector<uint8_t> result;
+        bool ready = false;
+        std::vector<uint8_t> Get() {
+            std::unique_lock<std::mutex> l(m);
+            cv.wait(l, [this]{ return ready; });
+            return std::move(result);
         }
+    };
 
-        size_t s_idx = data->next_slot.fetch_add(1) % PoolLayout::R_SIZE;
-        sem_init(&data->results[s_idx].semaphore, 1, 0);
-
-        size_t t_idx = data->tail.fetch_add(1) % PoolLayout::Q_SIZE;
+    ProcessPool(size_t n, ProcessorFunc proc) {
+        int res_p[2]; pipe(res_p);
+        res_read_fd = res_p[0];
         
-        data->tasks[t_idx].func = f;
-        std::memcpy(data->tasks[t_idx].arg, &arg, sizeof(T_Arg));
-        data->tasks[t_idx].slot_idx = s_idx;
-        
-        data->tasks[t_idx].filled.store(true, std::memory_order_release);
+        for (size_t i = 0; i < n; ++i) {
+            int task_p[2]; pipe(task_p);
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(task_p[1]); close(res_read_fd);
+                worker_loop(task_p[0], res_p[1], proc);
+                exit(0);
+            }
+            close(task_p[0]);
+            workers.push_back({pid, task_p[1]});
+        }
+        close(res_p[1]);
+        collector = std::thread(&ProcessPool::collect, this);
+    }
 
-        return MyFuture<T_Res>(&data->results[s_idx]);
+    std::shared_ptr<Future> Submit(uint32_t type, const std::vector<uint8_t>& data) {
+        uint64_t id = next_id++;
+        auto f = std::make_shared<Future>();
+        { std::lock_guard<std::mutex> l(map_mtx); fut_map[id] = f; }
+        
+        MessageHeader h{MAGIC, id, type, (uint64_t)data.size()};
+        FullWrite(workers[id % workers.size()].write_fd, &h, sizeof(h));
+        if (h.data_size > 0) FullWrite(workers[id % workers.size()].write_fd, data.data(), data.size());
+        return f;
     }
 
     ~ProcessPool() {
-        if (is_main) {
-            for (pid_t p : workers) {
-                kill(p, SIGTERM);
-                waitpid(p, NULL, 0);
-            }
-            for (size_t i = 0; i < PoolLayout::R_SIZE; ++i) {
-                sem_destroy(&data->results[i].semaphore);
-            }
-            munmap(data, sizeof(PoolLayout));
-        }
+        for (auto& w : workers) { close(w.write_fd); kill(w.pid, SIGTERM); waitpid(w.pid, NULL, 0); }
+        if (collector.joinable()) collector.join();
     }
 
 private:
-    void worker_loop() {
-        while (true) {
-            size_t h = data->head.load(std::memory_order_relaxed);
-            if (h < data->tail.load(std::memory_order_acquire)) {
-                if (data->head.compare_exchange_weak(h, h + 1)) {
-                    auto& t = data->tasks[h % PoolLayout::Q_SIZE];
-                    
-                    while (!t.filled.load(std::memory_order_acquire)) {
-                        std::this_thread::yield();
-                    }
+    void worker_loop(int r, int w, ProcessorFunc proc) {
+        MessageHeader h;
+        while (FullRead(r, &h, sizeof(h))) {
+            if (h.magic != MAGIC) continue; 
 
-                    t.func(t.arg, data->results[t.slot_idx].data);
-                    
-                    t.filled.store(false, std::memory_order_relaxed);
-                    sem_post(&data->results[t.slot_idx].semaphore);
+            std::vector<uint8_t> in(h.data_size);
+            if (h.data_size > 0) FullRead(r, in.data(), h.data_size);
+            
+            auto out = proc(h.task_type, in);
+            
+            MessageHeader rh{MAGIC, h.id, 0, (uint64_t)out.size()};
+            
+            std::vector<uint8_t> packet(sizeof(rh) + out.size());
+            std::memcpy(packet.data(), &rh, sizeof(rh));
+            if (!out.empty()) std::memcpy(packet.data() + sizeof(rh), out.data(), out.size());
+            
+            FullWrite(w, packet.data(), packet.size());
+        }
+    }
+
+    void collect() {
+        MessageHeader h;
+        while (FullRead(res_read_fd, &h, sizeof(h))) {
+            if (h.magic != MAGIC) {
+                char dummy;
+                while (read(res_read_fd, &dummy, 1) > 0) {}
+                continue;
+            }
+
+            std::vector<uint8_t> d(h.data_size);
+            if (h.data_size > 0) FullRead(res_read_fd, d.data(), h.data_size);
+            
+            std::shared_ptr<Future> f;
+            {
+                std::lock_guard<std::mutex> l(map_mtx);
+                if (fut_map.count(h.id)) {
+                    f = fut_map[h.id];
+                    fut_map.erase(h.id);
                 }
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            if (f) {
+                {
+                    std::lock_guard<std::mutex> l(f->m);
+                    f->result = std::move(d);
+                    f->ready = true;
+                }
+                f->cv.notify_all();
             }
         }
     }
+
+    std::vector<Worker> workers;
+    int res_read_fd;
+    std::atomic<uint64_t> next_id{0};
+    std::unordered_map<uint64_t, std::shared_ptr<Future>> fut_map;
+    std::mutex map_mtx;
+    std::thread collector;
 };
