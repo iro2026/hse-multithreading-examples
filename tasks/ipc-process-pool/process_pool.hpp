@@ -8,17 +8,18 @@
 #include <signal.h>
 #include <semaphore.h>
 #include <thread>
+#include <cstring>
 
-using TaskFunc = void* (*)(void*);
+using TaskFunc = void (*)(const void*, void*);
 
 struct ResultSlot {
     sem_t semaphore;
-    void* value;
+    char data[1024];
 };
 
 struct Task {
     TaskFunc func;
-    void* arg;
+    char arg[1024];
     size_t slot_idx;
     std::atomic<bool> filled{false};
 };
@@ -38,9 +39,12 @@ class MyFuture {
     ResultSlot* slot;
 public:
     MyFuture(ResultSlot* s) : slot(s) {}
+
     T get() {
         sem_wait(&slot->semaphore);
-        return (T)(uintptr_t)slot->value;
+        T result;
+        std::memcpy(&result, slot->data, sizeof(T));
+        return result;
     }
 };
 
@@ -82,8 +86,9 @@ public:
         size_t t_idx = data->tail.fetch_add(1) % PoolLayout::Q_SIZE;
         
         data->tasks[t_idx].func = f;
-        data->tasks[t_idx].arg = (void*)(uintptr_t)arg;
+        std::memcpy(data->tasks[t_idx].arg, &arg, sizeof(T_Arg));
         data->tasks[t_idx].slot_idx = s_idx;
+        
         data->tasks[t_idx].filled.store(true, std::memory_order_release);
 
         return MyFuture<T_Res>(&data->results[s_idx]);
@@ -114,8 +119,7 @@ private:
                         std::this_thread::yield();
                     }
 
-                    void* res = t.func(t.arg);
-                    data->results[t.slot_idx].value = res;
+                    t.func(t.arg, data->results[t.slot_idx].data);
                     
                     t.filled.store(false, std::memory_order_relaxed);
                     sem_post(&data->results[t.slot_idx].semaphore);
